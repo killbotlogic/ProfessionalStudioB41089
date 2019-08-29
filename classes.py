@@ -57,9 +57,7 @@ class Node:
         return self.position.__hash__()
 
     def tracks(self):
-        return {
-            Track(Node('A', Point(x=0.0, y=0.0)), Node('Whiskey', Point(x=7.0, y=7.0)), 2)
-        }
+        return {x for x in Earth.tracks if x.begins_at == self or x.ends_at == self}
 
 
 class RoutingTable:
