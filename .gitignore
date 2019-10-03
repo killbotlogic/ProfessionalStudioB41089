@@ -183,3 +183,5 @@ atlassian-ide-plugin.xml
 
 
 dataset.csv
+
+!.idea/*
