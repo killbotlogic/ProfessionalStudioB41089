@@ -257,6 +257,7 @@ class World(gym.Env):
             else:
                 dir = -1
             self.train.step(dir, track, track.track_length)
+
             self.state = {
                 'current_station': next_station
             }
@@ -265,8 +266,8 @@ class World(gym.Env):
         # self.train.step(direction=action['direction'], next_track=action['next_track'], speed=action['speed'])
         self.age += 1
 
-        self.done = self.train.destination == self.train.pos()
-        if not self.done:
+        self.done = self.destination == self.train.pos()
+        if self.done:
             reward = 0.0
         else:
             # reward = 1.0 / self.age
@@ -314,7 +315,7 @@ if __name__ == '__main__':
     import gym
     import numpy as np
 
-
+    from torch.optim.rmsprop import RMSprop
 
 
     na = Node(name='A', x=304.0, y=256.0)
@@ -359,10 +360,10 @@ if __name__ == '__main__':
 
     N_OUTPUTS = len(World.nodes)  # which station next
     LEARNING_RATE = 0.1
-    N_ITERATIONS = 20  # number of training iterations
+    N_EPISODES = 20  # number of training iterations
     N_MAX_STEPS = 1000  # max steps per episode
 
-    N_GAMES_PER_ITERATION = 3  # train the policy every 10 episodes
+    N_GAMES_PER_EPISODE = 3  # train the policy every 10 episodes
 
     # BATCH_SIZE = 128
     # GAMMA = 0.999
@@ -395,8 +396,11 @@ if __name__ == '__main__':
             x = torch.sigmoid(self.output_layer(x))
             return x
 
-
-    net = NextStationNet()
+    policy_net: NextStationNet = NextStationNet()
+    target_net: NextStationNet = NextStationNet()  # DQN(screen_height, screen_width, n_actions).to(device)
+    target_net.load_state_dict(policy_net.state_dict())
+    target_net.eval()
+    optimizer: RMSprop = RMSprop(policy_net.parameters())
 
     steps_done = 0  # super global variable
 
@@ -417,29 +421,32 @@ if __name__ == '__main__':
                 # found, so we pick action with the larger expected reward.
                 result = net(in_arr)  # .max(1)[1].view(1, 1)
                 max_idx = result.max(0)[1]
+                loss = 0
         else:
             max_idx = random.randrange(N_OUTPUTS)
+            loss = 0
         out_arr = torch.tensor([0.0] * N_OUTPUTS)
         out_arr[max_idx] = 1.0
         station = World.nodes[max_idx]
+
         return station
 
 
-    print(f"network topology: {net}")
 
-    # print(f"w_l1 = {round(net.hidden_layer.weight.item(), 4)}")
-    # print(f"b_l1 = {round(net.hidden_layer.bias.item(), 4)}")
-    # print(f"w_l2 = {round(net.output_layer.weight.item(), 4)}")
-    # print(f"b_l2 = {round(net.output_layer.bias.item(), 4)}")
+
+
+
+
+
+    print(f"network topology: {policy_net}")
 
     # run input data forward through network
     # track instance to one hot
-    input_data = torch.tensor([0] * N_INPUTS)
-    input_data[World.nodes.index(world.train.curr_station())] = 1  # start at node A
-    # input_data = torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    input_data = torch.tensor([0.0] * N_INPUTS)
+    input_data[World.nodes.index(world.train.curr_station())] = 1.0  # start at node A
 
-    output = net(input_data)
-    print(f"a_l2 = {round(output.item(), 4)}")
+    output = policy_net(input_data)
+
 
     # backpropagate gradient
 
@@ -449,40 +456,17 @@ if __name__ == '__main__':
 
     criterion = nn.MSELoss()
     loss = criterion(output, target)
-    net.zero_grad()
+    policy_net.zero_grad()
     loss.backward()
 
     # update weights and biases
-    optimizer = optim.SGD(net.parameters(), lr=0.1)
+    optimizer = optim.SGD(policy_net.parameters(), lr=0.1)
     optimizer.step()
 
-    output = net(input_data)
+    output = policy_net(input_data)
     print(f"updated_a_l2 = {round(output.item(), 4)}")
 
 
-    def make_car(initializer, learning_rate):
-        car = {}
-        car['X'] = tf.placeholder(tf.float32, shape=[None, 1])
-        car['Hidden'] = tf.layers.dense(inputs=car['X'], units=1, activation=tf.nn.elu, kernel_initializer=initializer)
-        car['Logits'] = tf.layers.dense(inputs=car['Hidden'], units=1, kernel_initializer=initializer)  # linear activation
-        car['Output'] = tf.nn.sigmoid(car['Logits'])  # probability of right
-
-        car['OutputArray'] = tf.concat(axis=1, values=[1 - car['Output'], car['Output']])
-        car['Action'] = tf.multinomial(tf.log(car['OutputArray']), num_samples=1)
-
-        car['Entropy'] = tf.nn.sigmoid_cross_entropy_with_logits(labels=tf.to_float(car['Action']), logits=car['Logits'])  # AKA: Loss
-        optimizer = tf.train.AdamOptimizer(learning_rate)
-
-        car['Gradients'] = []
-        car['GradientsAndVariables'] = []
-        for grad, variable in optimizer.compute_gradients(car['Entropy']):
-            car['Gradients'] += [grad]
-            car['GradientsAndVariables'] += [(tf.placeholder(tf.float32, shape=grad.get_shape()), variable)]
-
-        car['Trainer'] = optimizer.apply_gradients(car['GradientsAndVariables'])
-        return car
-
-    car_a = make_car(initializer, LEARNING_RATE)
 
 
     def discount_rewards(reward, discount_rate):
@@ -503,52 +487,147 @@ if __name__ == '__main__':
 
         # exploration policy. Try something new or stick with the known.
 
-
-
-
-    for iteration in range(N_ITERATIONS):
-        print(f"iteration: {iteration}")
+    for episode in range(N_EPISODES):
+        print(f"episode: {episode}")
         all_rewards = []  # all sequences of raw rewards for each episode
         all_gradients = []  # gradients saved at each step of each episode
-        all_entropy = []
-        for game in range(N_GAMES_PER_ITERATION):
+        # all_entropy = []
+        for game in range(N_GAMES_PER_EPISODE):
             print(f"  game: {game}")
 
-            current_rewards = []  # all raw rewards from the current episode
-            current_gradients = []  # all gradients from the current episode
+            curr_rewards = []  # all raw rewards from the current episode
+            curr_gradients = []  # all gradients from the current episode
             world.reset()
 
             world.render()
             time.sleep(1 / RENDER_FPS)
-
-            velocity = 0
             for step in range(N_MAX_STEPS):
 
-                next_station = select_action(net, from_station=world.train.curr_station(), to_station=world.destination)
-                val_log, val_out, val_act, val_ent, val_grads = sess.run(
-                    fetches=[car_a['Logits'], car_a['Output'], car_a['Action'], car_a['Entropy'], car_a['Gradients']],
-                    feed_dict={car_a['X']: np.array([[velocity]])})  # one obs
-                all_entropy += [val_ent]
+                # def make_car(initializer, learning_rate):
+                #     car = {}
+                #     car['X'] = tf.placeholder(tf.float32, shape=[None, 1])
+                #     car['Hidden'] = tf.layers.dense(inputs=car['X'], units=1, activation=tf.nn.elu, kernel_initializer=initializer)
+                #     car['Logits'] = tf.layers.dense(inputs=car['Hidden'], units=1, kernel_initializer=initializer)  # linear activation
+                #     car['Output'] = tf.nn.sigmoid(car['Logits'])  # probability of right
+                #
+                #     car['OutputArray'] = tf.concat(axis=1, values=[1 - car['Output'], car['Output']])
+                #     car['Action'] = tf.multinomial(tf.log(car['OutputArray']), num_samples=1)
+                #
+                #     car['Entropy'] = tf.nn.sigmoid_cross_entropy_with_logits(labels=tf.to_float(car['Action']), logits=car['Logits'])  # AKA: Loss
+                #     optimizer = tf.train.AdamOptimizer(learning_rate)
+                #
+                #     car['Gradients'] = []
+                #     car['GradientsAndVariables'] = []
+                #     for grad, variable in optimizer.compute_gradients(car['Entropy']):
+                #         car['Gradients'] += [grad]
+                #         car['GradientsAndVariables'] += [(tf.placeholder(tf.float32, shape=grad.get_shape()), variable)]
+                #
+                #     car['Trainer'] = optimizer.apply_gradients(car['GradientsAndVariables'])
+                #     return car
+                #
+                #
+                # car_a = make_car(initializer, LEARNING_RATE)
+                #
+                # val_log, val_out, val_act, val_ent, val_grads = sess.run(
+                #     fetches=[car_a['Logits'], car_a['Output'], car_a['Action'], car_a['Entropy'], car_a['Gradients']],
+                #     feed_dict={car_a['X']: np.array([[velocity]])})  # one obs
+                #
+                # all_entropy += [val_ent]
 
-                obs, reward, done, info = world.step(action={
-                    # 'direction': -1,
-                    # 'next_track': ra,
-                    # 'speed': 1.0
-                    'station': next_station
-                })
+                next_station = select_action(policy_net, from_station=world.train.curr_station(), to_station=world.destination)
+
+                curr_station, reward, done, info = world.step(next_station=next_station)
 
                 world.render()
                 time.sleep(1 / RENDER_FPS)
 
-                current_rewards += [reward]
-                current_gradients += [val_grads]
+                curr_rewards += [reward]
+                curr_gradients += [val_grads]
 
+                Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward'))
+                # count()
+                class ReplayMemory(object):
+
+                    def __init__(self, capacity):
+                        self.capacity = capacity
+                        self.memory = []
+                        self.position = 0
+
+                    def push(self, *args):
+                        """Saves a transition."""
+                        if len(self.memory) < self.capacity:
+                            self.memory.append(None)
+                        self.memory[self.position] = Transition(*args)
+                        self.position = (self.position + 1) % self.capacity
+
+                    def sample(self, batch_size):
+                        return random.sample(self.memory, batch_size)
+
+                    def __len__(self):
+                        return len(self.memory)
+
+
+                BATCH_SIZE = 128
+                GAMMA = 0.999
+
+                memory: ReplayMemory = ReplayMemory(10000)
+
+
+                def optimize_model():
+                    if len(memory) < BATCH_SIZE:
+                        return
+                    transitions = memory.sample(BATCH_SIZE)
+                    # Transpose the batch (see https://stackoverflow.com/a/19343/3343043 for
+                    # detailed explanation). This converts batch-array of Transitions
+                    # to Transition of batch-arrays.
+                    batch = Transition(*zip(*transitions))
+
+                    # Compute a mask of non-final states and concatenate the batch elements
+                    # (a final state would've been the one after which simulation ended)
+                    non_final_mask = torch.tensor(tuple(map(lambda s: s is not None, batch.next_state)), dtype=torch.uint8)  # survivors
+                    non_final_next_states = torch.cat([s for s in batch.next_state if s is not None])
+                    state_batch = torch.cat(batch.state)
+                    action_batch = torch.cat(batch.action)
+                    reward_batch = torch.cat(batch.reward)
+
+                    # Compute Q(s_t, a) - the model computes Q(s_t), then we select the
+                    # columns of actions taken. These are the actions which would've been taken
+                    # for each batch state according to policy_net
+                    state_action_values = policy_net(state_batch).gather(1, action_batch)
+
+                    # Compute V(s_{t+1}) for all next states.
+                    # Expected values of actions for non_final_next_states are computed based
+                    # on the "older" target_net; selecting their best reward with max(1)[0].
+                    # This is merged based on the mask, such that we'll have either the expected
+                    # state value or 0 in case the state was final.
+                    next_state_values = torch.zeros(BATCH_SIZE)
+                    next_state_values[non_final_mask] = target_net(non_final_next_states).max(1)[0].detach()
+                    # Compute the expected Q values
+                    expected_state_action_values = (next_state_values * GAMMA) + reward_batch
+
+                    # Compute Huber loss
+                    loss = F.smooth_l1_loss(state_action_values, expected_state_action_values.unsqueeze(1))
+
+                    # Optimize the model
+                    optimizer.zero_grad()
+                    loss.backward()
+                    for param in policy_net.parameters():
+                        param.grad.data.clamp_(-1, 1)
+                    optimizer.step()
+                optimize_model()
+
+                # loss = F.smooth_l1_loss(state_action_values, expected_state_action_values.unsqueeze(1))
+
+
+                # TARGET_UPDATE = 10
+                # if episode % TARGET_UPDATE == 0:
+                #     target_net.load_state_dict(policy_net.state_dict())
                 if done:
                     break
 
-            all_rewards += [current_rewards]
-            print(f"    reward: {len(current_rewards)}")
-            all_gradients += [current_gradients]
+            all_rewards += [curr_rewards]
+            print(f"    reward: {len(curr_rewards)}")
+            all_gradients += [curr_gradients]
         # At this point we have run the policy for 10 episodes, and we are
         # ready for a policy update using the algorithm described earlier.
         all_rewards_normalized = discount_and_normalize_rewards(all_rewards, discount_rate)
